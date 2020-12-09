@@ -302,21 +302,18 @@ enum class AndroidObjectInspectors : ObjectInspector {
   },
 
   DIALOG {
-    override val leakingObjectFilter = { heapObject: HeapObject ->
-      heapObject is HeapInstance &&
-        heapObject instanceOf "android.app.Dialog" &&
-        heapObject["android.app.Dialog", "mDecor"]!!.value.isNullReference
-    }
-
     override fun inspect(
       reporter: ObjectReporter
     ) {
       reporter.whenInstanceOf("android.app.Dialog") { instance ->
         val mDecor = instance["android.app.Dialog", "mDecor"]!!
-        if (mDecor.value.isNullReference) {
-          leakingReasons += mDecor describedWithValue "null"
+        // Can't infer leaking status: mDecor null means either never shown or dismiss.
+        // mDecor non null means the dialog is showing, but sometimes dialogs stay showing
+        // after activity destroyed so that's not really a non leak either.
+        labels += mDecor describedWithValue if (mDecor.value.isNullReference) {
+          "null"
         } else {
-          notLeakingReasons += mDecor describedWithValue "not null"
+          "not null"
         }
       }
     }
@@ -463,25 +460,12 @@ enum class AndroidObjectInspectors : ObjectInspector {
   },
 
   MORTAR_PRESENTER {
-    override val leakingObjectFilter = { heapObject: HeapObject ->
-      heapObject is HeapInstance &&
-        heapObject instanceOf "mortar.Presenter" &&
-        heapObject.getOrThrow("mortar.Presenter", "view").value.isNullReference
-    }
-
     override fun inspect(
       reporter: ObjectReporter
     ) {
       reporter.whenInstanceOf("mortar.Presenter") { instance ->
-        // Bugs in view code tends to cause Mortar presenters to still have a view when they actually
-        // should be unreachable, so in that case we don't know their reachability status. However,
-        // when the view is null, we're pretty sure they  never leaking.
         val view = instance.getOrThrow("mortar.Presenter", "view")
-        if (view.value.isNullReference) {
-          leakingReasons += view describedWithValue "null"
-        } else {
-          labels += view describedWithValue "set"
-        }
+        labels += view describedWithValue if (view.value.isNullReference) "null" else "not null"
       }
     }
   },
@@ -507,24 +491,12 @@ enum class AndroidObjectInspectors : ObjectInspector {
   },
 
   COORDINATOR {
-    override val leakingObjectFilter = { heapObject: HeapObject ->
-      heapObject is HeapInstance &&
-        heapObject instanceOf "com.squareup.coordinators.Coordinator" &&
-        !heapObject.getOrThrow(
-          "com.squareup.coordinators.Coordinator", "attached"
-        ).value.asBoolean!!
-    }
-
     override fun inspect(
       reporter: ObjectReporter
     ) {
       reporter.whenInstanceOf("com.squareup.coordinators.Coordinator") { instance ->
         val attached = instance.getOrThrow("com.squareup.coordinators.Coordinator", "attached")
-        if (attached.value.asBoolean!!) {
-          notLeakingReasons += attached describedWithValue "true"
-        } else {
-          leakingReasons += attached describedWithValue "false"
-        }
+        labels += attached describedWithValue "${attached.value.asBoolean}"
       }
     }
   },

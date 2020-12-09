@@ -1,14 +1,16 @@
 package leakcanary.internal
 
-import android.app.Application
-import android.content.res.Resources.NotFoundException
-import android.os.Build.VERSION.SDK_INT
 import android.os.Debug
 import android.os.SystemClock
 import leakcanary.HeapAnalysisConfig
+import leakcanary.HeapAnalysisInterceptor
+import leakcanary.HeapAnalysisJob
+import leakcanary.HeapAnalysisJob.Result
+import leakcanary.HeapAnalysisJob.Result.Canceled
+import leakcanary.HeapAnalysisJob.Result.Done
+import leakcanary.JobContext
 import okio.buffer
 import okio.sink
-import shark.AndroidResourceIdNames
 import shark.CloseableHeapGraph
 import shark.ConstantMemoryMetricsDualSourceProvider
 import shark.HeapAnalysis
@@ -23,66 +25,90 @@ import shark.OnAnalysisProgressListener
 import shark.SharkLog
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
-internal class ReleaseHeapAnalyzer(
-  private val application: Application,
+internal class RealHeapAnalysisJob(
+  private val heapDumpDirectoryProvider: () -> File,
   private val config: HeapAnalysisConfig,
-  private val listener: (HeapAnalysis) -> Unit
-) {
+  private val interceptors: List<HeapAnalysisInterceptor>,
+  override val context: JobContext
+) : HeapAnalysisJob, HeapAnalysisInterceptor.Chain {
 
-  @Volatile
-  private var stopAnalysing = false
-
-  private val backgroundHandler by lazy {
-    startBackgroundHandlerThread("heap-analyzer")
+  private val heapDumpDirectory by lazy {
+    heapDumpDirectoryProvider()
   }
 
-  private val analyzeHeap = Runnable {
-    stopAnalysing = false
-    val result = dumpAndAnalyzeHeap()
-    result.heapDumpFile.delete()
-    listener(result)
+  private val _canceled = AtomicReference<Canceled?>()
+
+  private val _executed = AtomicBoolean(false)
+
+  private lateinit var executionThread: Thread
+
+  private var interceptorIndex = 0
+
+  private var analysisStep: OnAnalysisProgressListener.Step? =  null
+
+  override val executed
+    get() = _executed.get()
+
+  override val canceled
+    get() = _canceled.get() != null
+
+  override val job: HeapAnalysisJob
+    get() = this
+
+  override fun execute(): Result {
+    check(_executed.compareAndSet(false, true)) { "HeapAnalysisJob can only be executed once" }
+    SharkLog.d { "Starting heap analysis job" }
+    executionThread = Thread.currentThread()
+    return proceed()
   }
 
-  fun removeAllHeapDumpFiles() {
-    backgroundHandler.post {
-      val filesDir = application.filesDir!!
-      val heapDumpFiles = filesDir.listFiles { _, name ->
-        name.startsWith("heap-") && name.endsWith(".hprof")
-      }
-      heapDumpFiles?.forEach { it.delete() }
+  override fun cancel(cancelReason: String) {
+    // If cancel is called several times, we use the first cancel reason.
+    _canceled.compareAndSet(null, Canceled(cancelReason))
+  }
+
+  override fun proceed(): Result {
+    check(Thread.currentThread() == executionThread) {
+      "Interceptor.Chain.proceed() called from unexpected thread ${Thread.currentThread()} instead of $executionThread"
     }
-  }
-
-  fun start() {
-    backgroundHandler.removeCallbacks(analyzeHeap)
-    backgroundHandler.post(analyzeHeap)
-  }
-
-  fun stop() {
-    stopAnalysing = true
-    backgroundHandler.removeCallbacks(analyzeHeap)
-  }
-
-  fun shutdown() {
-    if (SDK_INT >= 18) {
-      backgroundHandler.looper.quitSafely()
+    check(interceptorIndex <= interceptors.size) {
+      "Interceptor.Chain.proceed() should be called max once per interceptor"
+    }
+    _canceled.get()?.let {
+      interceptorIndex = interceptors.size + 1
+      return it
+    }
+    if (interceptorIndex < interceptors.size) {
+      val currentInterceptor = interceptors[interceptorIndex]
+      interceptorIndex++
+      return currentInterceptor.intercept(this)
     } else {
-      backgroundHandler.looper.quit()
+      interceptorIndex++
+      val analysis = dumpAndAnalyzeHeap()
+      analysis.heapDumpFile.delete()
+      if (analysis is HeapAnalysisFailure) {
+        val cause = analysis.exception.cause
+        if (cause is StopAnalysis) {
+          return _canceled.get()!!.run {
+            copy(cancelReason = "$cancelReason (stopped at ${cause.step})")
+          }
+        }
+      }
+      return Done(analysis)
     }
   }
 
   private fun dumpAndAnalyzeHeap(): HeapAnalysis {
-    val filesDir = application.filesDir!!
-    val fileNamePrefix = "heap-${UUID.randomUUID()}"
-    val sensitiveHeapDumpFile = File(filesDir, "$fileNamePrefix.hprof").apply {
+    val filesDir = heapDumpDirectory
+    filesDir.mkdirs()
+    val fileNameBase = "$HPROF_PREFIX${UUID.randomUUID()}"
+    val sensitiveHeapDumpFile = File(filesDir, "$fileNameBase$HPROF_SUFFIX").apply {
       // Any call to System.exit(0) will run shutdown hooks that will attempt to remove this
       // file. Note that this is best effort, and won't delete if the VM is killed by the system.
       deleteOnExit()
-    }
-
-    if (!config.stripHeapDump) {
-      saveResourceIdNamesToMemory()
     }
 
     val heapDumpStart = SystemClock.uptimeMillis()
@@ -93,12 +119,13 @@ internal class ReleaseHeapAnalyzer(
     var heapDumpFile = sensitiveHeapDumpFile
 
     try {
+      runGc()
       dumpHeap(sensitiveHeapDumpFile)
       dumpDurationMillis = SystemClock.uptimeMillis() - heapDumpStart
 
       val stripDuration = measureDurationMillis {
         if (config.stripHeapDump) {
-          val strippedHeapDumpFile = File(filesDir, "$fileNamePrefix-stripped.hprof").apply {
+          val strippedHeapDumpFile = File(filesDir, "$fileNameBase-stripped$HPROF_SUFFIX").apply {
             deleteOnExit()
           }
           heapDumpFile = strippedHeapDumpFile
@@ -146,23 +173,26 @@ internal class ReleaseHeapAnalyzer(
     }
   }
 
-  private fun saveResourceIdNamesToMemory() {
-    val resources = application.resources
-    AndroidResourceIdNames.saveToMemory(
-      getResourceTypeName = { id ->
-        try {
-          resources.getResourceTypeName(id)
-        } catch (e: NotFoundException) {
-          null
-        }
-      },
-      getResourceEntryName = { id ->
-        try {
-          resources.getResourceEntryName(id)
-        } catch (e: NotFoundException) {
-          null
-        }
-      })
+  private fun runGc() {
+    // Code taken from AOSP FinalizationTest:
+    // https://android.googlesource.com/platform/libcore/+/master/support/src/test/java/libcore/
+    // java/lang/ref/FinalizationTester.java
+    // System.gc() does not garbage collect every time. Runtime.gc() is
+    // more likely to perform a gc.
+    Runtime.getRuntime()
+      .gc()
+    enqueueReferences()
+    System.runFinalization()
+  }
+
+  private fun enqueueReferences() {
+    // Hack. We don't have a programmatic way to wait for the reference queue daemon to move
+    // references to the appropriate queues.
+    try {
+      Thread.sleep(100)
+    } catch (e: InterruptedException) {
+      throw AssertionError()
+    }
   }
 
   private fun saveHeapDumpTime(heapDumpUptimeMillis: Long) {
@@ -193,8 +223,8 @@ internal class ReleaseHeapAnalyzer(
     strippedHeapDumpFile: File
   ) {
     val sensitiveSourceProvider =
-      StoppableFileSourceProvider(sourceHeapDumpFile, "sensitive hprof") {
-        stopAnalysing
+      StoppableFileSourceProvider(sourceHeapDumpFile) {
+        checkStopAnalysis("stripping heap dump")
       }
 
     val strippedHprofSink = strippedHeapDumpFile.outputStream().sink().buffer()
@@ -206,8 +236,8 @@ internal class ReleaseHeapAnalyzer(
   private fun analyzeHeapWithStats(heapDumpFile: File): Pair<HeapAnalysis, String> {
     val fileLength = heapDumpFile.length()
     val analysisSourceProvider = ConstantMemoryMetricsDualSourceProvider(
-      StoppableFileSourceProvider(heapDumpFile, "stripped hprof") {
-        stopAnalysing
+      StoppableFileSourceProvider(heapDumpFile) {
+        checkStopAnalysis(analysisStep?.name ?: "Reading heap dump")
       })
 
     return analysisSourceProvider.openHeapGraph().use { graph ->
@@ -231,9 +261,8 @@ internal class ReleaseHeapAnalyzer(
     graph: CloseableHeapGraph
   ): HeapAnalysis {
     val stepListener = OnAnalysisProgressListener { step ->
-      check(!stopAnalysing) {
-        "Requested stop analysis at step ${step.name}"
-      }
+      analysisStep = step
+      checkStopAnalysis(step.name)
       SharkLog.d { "Analysis in progress, working on: ${step.name}" }
     }
 
@@ -248,4 +277,23 @@ internal class ReleaseHeapAnalyzer(
       metadataExtractor = config.metadataExtractor
     )
   }
+
+  private fun checkStopAnalysis(step: String) {
+    if (_canceled.get() != null) {
+      throw StopAnalysis(step)
+    }
+  }
+
+  class StopAnalysis(val step: String) : Exception() {
+    override fun fillInStackTrace(): Throwable {
+      // Skip filling in stacktrace.
+      return this
+    }
+  }
+  companion object {
+    const val HPROF_PREFIX = "heap-"
+    const val HPROF_SUFFIX = ".hprof"
+
+  }
+
 }

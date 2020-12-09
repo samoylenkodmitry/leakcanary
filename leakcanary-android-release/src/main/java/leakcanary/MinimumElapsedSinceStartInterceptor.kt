@@ -1,46 +1,41 @@
 package leakcanary
 
+import android.annotation.SuppressLint
 import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import android.system.Os
 import android.system.OsConstants
-import leakcanary.HeapAnalysisCondition.Result
-import leakcanary.HeapAnalysisCondition.Result.StartAnalysis
-import leakcanary.HeapAnalysisCondition.Result.StopAnalysis
-import leakcanary.internal.uiHandler
+import leakcanary.HeapAnalysisInterceptor.Chain
+import leakcanary.HeapAnalysisJob.Result
 import java.io.BufferedReader
 import java.io.FileReader
+import java.util.concurrent.TimeUnit
 
-class MinimumElapsedSinceStartCondition(
-  private val minElapsedSinceStartMillis: Long = 30_000
-) : HeapAnalysisCondition() {
+@SuppressLint("NewApi")
+class MinimumElapsedSinceStartInterceptor(
+  private val minimumElapsedSinceStartMillis: Long = TimeUnit.SECONDS.toMillis(30)
+) : HeapAnalysisInterceptor {
 
-  private val postedRetry =
-    Runnable { trigger.conditionChanged("enough time elapsed since app start") }
+  private val processStartUptimeMillis by lazy {
+    Process.getStartUptimeMillis()
+  }
 
-  private var enoughTimeElapsed = false
+  private val processForkRealtimeMillis by lazy {
+    readProcessForkRealtimeMillis()
+  }
 
-  override fun evaluate(): Result {
-    if (enoughTimeElapsed) {
-      return StartAnalysis
+  override fun intercept(chain: Chain): Result {
+    if (elapsedMillisSinceStart() < minimumElapsedSinceStartMillis) {
+      chain.job.cancel("app started less than $minimumElapsedSinceStartMillis ms ago.")
     }
-    uiHandler.removeCallbacks(postedRetry)
-    val elapsedMillisSinceStart = elapsedMillisSinceStart()
-    return if (elapsedMillisSinceStart >= minElapsedSinceStartMillis) {
-      enoughTimeElapsed = true
-      StartAnalysis
-    } else {
-      val remainingMillis = minElapsedSinceStartMillis - elapsedMillisSinceStart
-      uiHandler.postDelayed(postedRetry, remainingMillis)
-      StopAnalysis("Not enough time elapsed since start, will retry in $remainingMillis ms")
-    }
+    return chain.proceed()
   }
 
   private fun elapsedMillisSinceStart() = if (Build.VERSION.SDK_INT >= 24) {
-    SystemClock.uptimeMillis() - Process.getStartUptimeMillis()
+    SystemClock.uptimeMillis() - processStartUptimeMillis
   } else {
-    SystemClock.elapsedRealtime() - readProcessForkRealtimeMillis()
+    SystemClock.elapsedRealtime() - processForkRealtimeMillis
   }
 
   /**

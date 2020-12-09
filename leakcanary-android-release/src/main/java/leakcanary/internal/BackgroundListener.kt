@@ -15,8 +15,6 @@ internal class BackgroundListener(
   private val callback: (Boolean) -> Unit
 ) : ActivityLifecycleCallbacks by noOpDelegate() {
 
-  private val handler = Handler(Looper.getMainLooper())
-
   private val checkAppInBackground: Runnable = object : Runnable {
     private val memoryOutState = RunningAppProcessInfo()
     override fun run() {
@@ -25,8 +23,8 @@ internal class BackgroundListener(
         memoryOutState.importance >= RunningAppProcessInfo.IMPORTANCE_BACKGROUND
       updateBackgroundState(appInBackgroundNow)
       if (!appInBackgroundNow) {
-        handler.removeCallbacks(this)
-        handler.postDelayed(this, BACKGROUND_REPEAT_DELAY_MS)
+        uiHandler.removeCallbacks(this)
+        uiHandler.postDelayed(this, BACKGROUND_REPEAT_DELAY_MS)
       }
     }
   }
@@ -52,13 +50,13 @@ internal class BackgroundListener(
   }
 
   override fun onActivityPaused(activity: Activity) {
-    handler.removeCallbacks(checkAppInBackground)
-    handler.postDelayed(checkAppInBackground, BACKGROUND_DELAY_MS)
+    uiHandler.removeCallbacks(checkAppInBackground)
+    uiHandler.postDelayed(checkAppInBackground, BACKGROUND_DELAY_MS)
   }
 
   override fun onActivityResumed(activity: Activity) {
     updateBackgroundState(appInBackgroundNow = false)
-    handler.removeCallbacks(checkAppInBackground)
+    uiHandler.removeCallbacks(checkAppInBackground)
   }
 
   companion object {
